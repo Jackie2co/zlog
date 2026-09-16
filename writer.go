@@ -2,9 +2,11 @@ package zlog
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +29,19 @@ const (
 	// cleanupInterval is the minimum interval between directory scans
 	// that enforce KeepDays/MaxBackups.
 	cleanupInterval = time.Hour
+	// errReportInterval rate-limits internal failure reports on stderr.
+	// A failure such as a full disk keeps repeating, so reporting every
+	// occurrence would flood stderr and reporting only the first one would
+	// hide a problem that is still going on.
+	errReportInterval = time.Minute
 
 	fileMode = 0o644
 	dirMode  = 0o755
+
+	// timeHourLayout names hourly rotated files (time based rotation),
+	// timeSecondLayout names size rotated files.
+	timeHourLayout   = "2006-01-02-15"
+	timeSecondLayout = "2006-01-02-15-04-05"
 )
 
 type writerConfig struct {
@@ -56,15 +68,21 @@ type fileWriter struct {
 	dirty       int64 // bytes written since the last sync+fadvise
 	lastSync    time.Time
 	lastCleanup time.Time
-	nextRotate  time.Time
-	closed      bool
-	now         func() time.Time
+	// curSlot is the rotation slot (the truncated hour) that the open file
+	// belongs to. Rotation compares it with the wall clock instead of
+	// tracking a "next rotation" deadline, so a clock step in either
+	// direction can never leave the writer appending to a file that does
+	// not match the timestamps inside it.
+	curSlot time.Time
+	closed  bool
+	now     func() time.Time
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	doneCh   chan struct{}
 
-	errOnce sync.Once // report the first internal failure to stderr only
+	errMu         sync.Mutex // guards lastErrReport
+	lastErrReport time.Time
 }
 
 func newFileWriter(cfg writerConfig, now ...func() time.Time) (*fileWriter, error) {
@@ -101,9 +119,13 @@ func (w *fileWriter) loop() {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			_ = w.flushLocked()
+			if err := w.flushLocked(); err != nil {
+				w.reportErr(err)
+			}
 			if w.now().Sub(w.lastSync) >= syncInterval {
-				_ = w.syncLocked()
+				if err := w.syncLocked(); err != nil {
+					w.reportErr(err)
+				}
 			}
 			if w.now().Sub(w.lastCleanup) >= cleanupInterval {
 				w.lastCleanup = w.now()
@@ -123,13 +145,19 @@ func (w *fileWriter) Write(p []byte) (int, error) {
 	if len(p) > cap(w.buf) {
 		// oversized entry: bypass the buffer, but drain pending data first
 		if err := w.flushLocked(); err != nil {
-			return 0, err
+			w.reportErr(err)
 		}
 		return w.writeFileLocked(p)
 	}
 	if len(w.buf)+len(p) > cap(w.buf) {
 		if err := w.flushLocked(); err != nil {
-			return 0, err
+			// The buffer could not be fully drained (a full disk, for
+			// example). Keep the entry whenever there is room for it: it
+			// is retried on the next flush instead of being dropped.
+			w.reportErr(err)
+			if len(w.buf)+len(p) > cap(w.buf) {
+				return 0, err
+			}
 		}
 	}
 	w.buf = append(w.buf, p...)
@@ -167,13 +195,24 @@ func (w *fileWriter) Close() error {
 	return nil
 }
 
+// flushLocked writes the buffered entries out. Bytes that could not be
+// written (a short write or an error such as ENOSPC) stay in the buffer so
+// the caller can retry them, which is what keeps a failing disk from
+// silently discarding logs.
 func (w *fileWriter) flushLocked() error {
-	if len(w.buf) == 0 {
-		return nil
+	for len(w.buf) > 0 {
+		n, err := w.writeFileLocked(w.buf)
+		if n > 0 {
+			w.buf = append(w.buf[:0], w.buf[n:]...)
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
-	_, err := w.writeFileLocked(w.buf)
-	w.buf = w.buf[:0]
-	return err
+	return nil
 }
 
 func (w *fileWriter) writeFileLocked(p []byte) (int, error) {
@@ -186,30 +225,45 @@ func (w *fileWriter) writeFileLocked(p []byte) (int, error) {
 	}
 	if w.shouldRotateLocked() {
 		if err := w.rotateLocked(); err != nil {
-			return 0, err
+			// Keep appending to the current file rather than dropping the
+			// entry; the rotation is retried on the next write.
+			w.reportErr(err)
 		}
 	}
 	n, err := w.file.Write(p)
 	w.curLen += int64(n)
 	w.dirty += int64(n)
+	if err == nil && n < len(p) {
+		err = io.ErrShortWrite
+	}
 	if err != nil {
 		return n, err
 	}
 	if w.cfg.rotation == "size" && w.cfg.maxSize > 0 && w.curLen >= w.cfg.maxSize {
 		if rerr := w.rotateLocked(); rerr != nil {
-			return n, rerr
+			w.reportErr(rerr)
 		}
 	}
 	if w.dirty >= syncBytesThreshold {
+		// a failed fsync means the data is not durable yet, not that it was
+		// not written: report it and keep going
 		if serr := w.syncLocked(); serr != nil {
-			return n, serr
+			w.reportErr(serr)
 		}
 	}
 	return n, nil
 }
 
+// shouldRotateLocked reports whether the open file still matches the
+// current rotation slot. Comparing slots (rather than a "next rotation"
+// deadline) also covers the boundary instant itself and clock steps: an
+// entry written at exactly HH:00:00 belongs to the HH file, and after a
+// backward step the writer returns to the file matching the wall clock.
 func (w *fileWriter) shouldRotateLocked() bool {
-	return w.cfg.rotation != "size" && w.now().After(w.nextRotate)
+	if w.cfg.rotation == "size" {
+		return false
+	}
+	return !w.now().Truncate(time.Hour).Equal(w.curSlot)
 }
 
 func (w *fileWriter) rotateLocked() error {
@@ -217,50 +271,61 @@ func (w *fileWriter) rotateLocked() error {
 		return os.ErrClosed
 	}
 	// flush data out and drop the old file's page cache before switching
-	_ = w.syncLocked()
-	next, err := w.openNext()
+	if err := w.syncLocked(); err != nil {
+		w.reportErr(err)
+	}
+	slot := w.rotationTime()
+	next, err := w.openNext(slot)
 	if err != nil {
 		// keep writing to the old file instead of going dead; the caller
 		// retries rotation on the next write once the path recovers
-		w.reportErr(err)
 		return err
 	}
 	old := w.file
 	w.file = next
+	w.curSlot = slot
 	w.curLen = 0
 	w.dirty = 0
 	w.lastSync = w.now()
-	w.nextRotate = w.now().Truncate(time.Hour).Add(time.Hour)
 	_ = old.Close()
 	w.updateLink()
 	w.cleanupLocked()
 	return nil
 }
 
-// reportErr surfaces the first internal failure (e.g. ENOSPC) on stderr;
-// zap itself also reports write errors to its ErrorOutput on every entry,
-// so this only covers writer-internal failures like a failed rotation.
+// reportErr surfaces internal failures (a failed rotation, a failed fsync,
+// a short write) on stderr. zap itself also reports write errors to its
+// ErrorOutput on every entry, so this covers the paths where zap would not
+// see anything, such as a background flush failure. Reports are rate
+// limited: a persistent problem must stay visible without flooding stderr.
 func (w *fileWriter) reportErr(err error) {
-	w.errOnce.Do(func() {
-		fmt.Fprintf(os.Stderr, "[zlog] %s: %v (further errors suppressed)\n", w.cfg.name, err)
-	})
+	w.errMu.Lock()
+	defer w.errMu.Unlock()
+	now := w.now()
+	if !w.lastErrReport.IsZero() && now.Sub(w.lastErrReport) < errReportInterval {
+		return
+	}
+	w.lastErrReport = now
+	fmt.Fprintf(os.Stderr, "[zlog] %s: %v (reports rate limited to one per %s)\n",
+		w.cfg.name, err, errReportInterval)
 }
 
 func (w *fileWriter) syncLocked() error {
 	if w.file == nil || w.dirty == 0 {
 		return nil
 	}
-	syncAndDrop(w.file)
+	err := syncAndDrop(w.file)
 	w.dirty = 0
 	w.lastSync = w.now()
-	return nil
+	return err
 }
 
 func (w *fileWriter) open() error {
 	if err := os.MkdirAll(w.cfg.dir, dirMode); err != nil {
 		return err
 	}
-	f, err := w.openNext()
+	slot := w.rotationTime()
+	f, err := w.openNext(slot)
 	if err != nil {
 		return err
 	}
@@ -270,23 +335,32 @@ func (w *fileWriter) open() error {
 		return err
 	}
 	w.file = f
+	w.curSlot = slot
 	w.curLen = st.Size()
 	w.dirty = 0
 	w.lastSync = w.now()
-	w.nextRotate = w.now().Truncate(time.Hour).Add(time.Hour)
 	// evict any stale page cache left by a previous process
 	if st.Size() > 0 {
-		syncAndDrop(f)
+		_ = syncAndDrop(f)
 	}
 	w.updateLink()
 	return nil
 }
 
-// openNext opens the file that should be written to next (current rotation
-// slot). It does not touch writer state, so a failure leaves the writer
-// fully usable.
-func (w *fileWriter) openNext() (*os.File, error) {
-	return os.OpenFile(filepath.Join(w.cfg.dir, w.fileName(w.now())),
+// rotationTime returns the timestamp that names the file which should be
+// open right now: the current hour for time based rotation, the current
+// instant for size based rotation.
+func (w *fileWriter) rotationTime() time.Time {
+	if w.cfg.rotation == "size" {
+		return w.now()
+	}
+	return w.now().Truncate(time.Hour)
+}
+
+// openNext opens the file for the given rotation slot. It does not touch
+// writer state, so a failure leaves the writer fully usable.
+func (w *fileWriter) openNext(t time.Time) (*os.File, error) {
+	return os.OpenFile(filepath.Join(w.cfg.dir, w.fileName(t)),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, fileMode)
 }
 
@@ -294,9 +368,9 @@ func (w *fileWriter) openNext() (*os.File, error) {
 // time-based (backward compatible), second-granularity when size-based.
 func (w *fileWriter) fileName(t time.Time) string {
 	if w.cfg.rotation == "size" {
-		return w.uniqueName(fmt.Sprintf("%s-%s.log", w.cfg.name, t.Format("2006-01-02-15-04-05")))
+		return w.uniqueName(fmt.Sprintf("%s-%s.log", w.cfg.name, t.Format(timeSecondLayout)))
 	}
-	return fmt.Sprintf("%s-%s.log", w.cfg.name, t.Format("2006-01-02-15"))
+	return fmt.Sprintf("%s-%s.log", w.cfg.name, t.Format(timeHourLayout))
 }
 
 func (w *fileWriter) uniqueName(base string) string {
@@ -313,11 +387,44 @@ func (w *fileWriter) uniqueName(base string) string {
 }
 
 // updateLink repoints <name>.log to the current file so tail/readers
-// always follow the live log.
+// always follow the live log. The target is made absolute because a
+// relative Path (go-zero's default is "logs") would otherwise create a
+// link that resolves next to the link itself and dangles.
 func (w *fileWriter) updateLink() {
 	link := filepath.Join(w.cfg.dir, w.cfg.name+".log")
+	target := w.file.Name()
+	if abs, err := filepath.Abs(target); err == nil {
+		target = abs
+	}
 	_ = os.Remove(link)
-	_ = os.Symlink(w.file.Name(), link)
+	_ = os.Symlink(target, link)
+}
+
+// isOwnFile reports whether name is a rotated file of this logger. The
+// name is matched exactly ("<name>-<timestamp>.log") instead of by a bare
+// prefix: with a plain prefix match a sibling logger whose name starts
+// with this one ("app" and "app-errors" writing into the same directory)
+// would have its live files deleted as if they were our backups.
+func (w *fileWriter) isOwnFile(name string) bool {
+	prefix := w.cfg.name + "-"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".log") {
+		return false
+	}
+	stem := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".log")
+	// both layouts are accepted so files survive a change of Rotation mode
+	for _, layout := range []string{timeHourLayout, timeSecondLayout} {
+		if _, err := time.ParseInLocation(layout, stem, time.Local); err == nil {
+			return true
+		}
+	}
+	// size rotation appends "-1", "-2", ... to disambiguate a slot
+	if i := strings.LastIndexByte(stem, '-'); i > 0 {
+		if _, err := strconv.Atoi(stem[i+1:]); err == nil {
+			_, err := time.ParseInLocation(timeSecondLayout, stem[:i], time.Local)
+			return err == nil
+		}
+	}
+	return false
 }
 
 // cleanupLocked enforces KeepDays (by mtime) and, for size rotation,
@@ -327,7 +434,6 @@ func (w *fileWriter) cleanupLocked() {
 	if err != nil {
 		return
 	}
-	prefix := w.cfg.name + "-"
 	current := ""
 	if w.file != nil {
 		current = filepath.Base(w.file.Name())
@@ -335,7 +441,7 @@ func (w *fileWriter) cleanupLocked() {
 	now := w.now()
 	var backups []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), prefix) || !strings.HasSuffix(e.Name(), ".log") {
+		if e.IsDir() || !w.isOwnFile(e.Name()) {
 			continue
 		}
 		if e.Name() == current {

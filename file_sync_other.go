@@ -7,6 +7,6 @@ import "os"
 // syncAndDrop falls back to a plain fsync on platforms without an
 // fadvise(FADV_DONTNEED) syscall; logs are still durable, only the page
 // cache eviction is skipped.
-func syncAndDrop(f *os.File) {
-	_ = f.Sync()
+func syncAndDrop(f *os.File) error {
+	return f.Sync()
 }
