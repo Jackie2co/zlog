@@ -8,39 +8,58 @@
 
 ## 安装
 
-    github.com/hide-in-code/zlog
+    go get github.com/hide-in-code/zlog
 
 ## 使用
 
-    package handler
+从 go-zero 的配置里拿 `logx.LogConf`（`rest.RestConf`/`zrpc.RpcConf` 都内嵌了
+`service.ServiceConf`，日志配置字段是 `Log`），按名字创建 logger：
+
+    // etc/app.yaml
+    // Name: v2vReceive
+    // Log:
+    //   Mode: file
+    //   Path: logs
+    //   Level: info
+    //   Encoding: json
+    //   Rotation: daily     # 本库把 daily 实现为按小时切分
+    //   KeepDays: 0         # 不按天数清理
+    //   MaxBackups: 8       # 整个目录最多保留 8 个日志文件（含正在写的那个）
+
+    package main
 
     import (
-        "net/http"
-
-        "demo/internal/logic"
-        "demo/internal/svc"
-        "demo/internal/types"
-        "github.com/zeromicro/go-zero/rest/httpx"
+        "github.com/hide-in-code/zlog"
+        "github.com/zeromicro/go-zero/core/conf"
+        "github.com/zeromicro/go-zero/rest"
+        "go.uber.org/zap"
     )
 
-    var takeoverLogger *logger.Logger
+    type Config struct {
+        rest.RestConf
+    }
 
-    func DemoHandler(svcCtx *svc.ServiceContext) http.HandlerFunc {
-        return func(w http.ResponseWriter, r *http.Request) {
-            var req types.Request
-            if err := httpx.Parse(r, &req); err != nil {
-                httpx.ErrorCtx(r.Context(), w, err)
-                return
-            }
+    func main() {
+        var c Config
+        conf.MustLoad("etc/app.yaml", &c)
 
-            l := logic.NewdemoLogic(r.Context(), svcCtx)
-            resp, err := l.demo(&req)
-            if err != nil {
-                httpx.ErrorCtx(r.Context(), w, err)
-            } else {
-                httpx.OkJsonCtx(r.Context(), w, resp)
-            }
-        }
+        // 名字决定子目录与文件前缀：logs/v2vReceive/v2vReceive-2026-09-16-00.log
+        logger := zlog.NewWithConf("v2vReceive", c.Log)
+        defer zlog.CloseAll() // 退出前把所有缓冲刷盘
+
+        logger.Info("service started", zap.String("addr", c.Host))
+        logger.Error("upstream failed",
+            zap.String("peer", "10.0.0.1"),
+            zap.Int("retry", 3),
+        )
+    }
+
+业务代码里同样按名字取用即可（同名 logger 是同一个实例，不需要到处传指针）：
+
+    func (l *ReceiveLogic) Receive(req *types.Request) error {
+        logger := zlog.NewWithConf("v2vReceive", l.svcCtx.Config.Log)
+        logger.Info("received", zap.String("vin", req.Vin))
+        return nil
     }
 
 ## 行为与配置
@@ -51,12 +70,28 @@
 | --- | --- | --- |
 | Mode | console | `file`/`volume` 走文件写入，否则输出到 stdout |
 | Path | logs | 日志目录，实际写入 `<Path>/<name>/` 下 |
-| Level | info | debug/info/warn/error；`severe`/`fatal` 按 error 处理（避免未 flush 就被 os.Exit） |
+| Level | info | 不低于该级别的日志才写：debug 全写，info 还会写 warn/error，error 只写 error；`severe`/`fatal` 按 error 处理（避免未 flush 就被 os.Exit） |
 | Encoding | json | `json` 或 `plain` |
-| KeepDays | 0（永久保留） | 按文件 mtime 清理过期日志 |
+| KeepDays | 0（永久保留） | 按文件 mtime 清理超过 N 天的日志 |
 | Rotation | daily | `daily`=按小时轮转；`size`=按 MaxSize 轮转 |
 | MaxSize | 0（size 模式默认 100MB） | 单文件大小上限，单位 MB |
-| MaxBackups | 0（不限制） | size 模式下最多保留的轮转文件数 |
+| MaxBackups | 0（不限制） | **日志目录最多保留多少个日志文件**（含正在写的那个），两种轮转模式都生效 |
+
+保留策略（受限设备主要靠这里控制占用）：
+
+- `MaxBackups=N`（N>0）表示目录里最多留 N 个日志文件，即最近的 N 个时间片。
+  按小时轮转且 `N=8` 时，目录里始终是「当前小时 + 前 7 个小时」≈ 8 小时窗口。
+- **正在写的那个文件永远不删**，所以 `N=1` 表示只留当前小时。
+- `KeepDays` 与 `MaxBackups` 相互独立、谁先命中谁删（与 go-zero 的说明一致）。
+  `MaxBackups=0` 且 `KeepDays=0` 时永不删除，日志会一直涨，受限设备务必至少设一个。
+- 清理在启动时、每次轮转时、以及每小时巡检时执行；不再需要外部 cron 删文件
+  （外部删除可能删到进程正持有的 inode，数据会写进已 unlink 的文件里而「消失」）。
+- 每次删除会在 stderr 打印一行 `[zlog] <name>: retained N log files, removed M`，
+  便于确认策略是否真的生效。
+
+> 与 go-zero 的差异：`logx` 只在 `size` 模式使用 `MaxBackups`，且文件按
+> `access/error/severe/slow/stat` 分类；本库把它统一成「目录内日志文件数上限」，
+> 并且在按小时轮转下也生效，文件名保持 `<name>-YYYY-MM-DD-HH.log` 可读。
 
 文件写入特性：
 
@@ -91,9 +126,11 @@
 
 怀疑日志缺失时按顺序检查：
 
-1. `df -h`：磁盘是否写满。`KeepDays=0`（默认）表示**永不删除旧日志**，
+1. `df -h`：磁盘是否写满。`KeepDays=0` 且 `MaxBackups=0`（都是默认）表示**永不删除旧日志**，
    按 382MB/小时算一天就是 9GB，嵌入式设备很容易被写满，写满后日志会大量丢失。
-2. 应用 stderr / journal 里是否有 `[zlog] ...` 或 zap 的 `write error`。
+   受限设备建议按排查窗口设 `MaxBackups`（例如要查最近 8 小时就设 8）。
+2. 应用 stderr / journal 里是否有 `[zlog] ...` 或 zap 的 `write error`；
+   正常工作时每小时会有一条 `retained N log files, removed M`。
 3. 确认应用实际传入的 `logx.LogConf`（尤其 `Mode`、`Path`、`Level`、`Rotation`）：
    `size` 轮转的文件名带秒，其它值（含 `daily`）走按小时命名。
 4. 用 `tail -f <name>.log` 看实时写入是否在继续；`ls -l --time-style=full-iso`

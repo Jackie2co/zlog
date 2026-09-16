@@ -52,12 +52,12 @@ func createLogger(name string, logConf logx.LogConf) *Logger {
 	if logConf.Mode == "file" || logConf.Mode == "volume" {
 		_ = os.MkdirAll(logConf.Path, 0o755)
 		w, err := newFileWriter(writerConfig{
-			dir:        logConf.Path,
-			name:       name,
-			keepDays:   logConf.KeepDays,
-			maxBackups: logConf.MaxBackups,
-			maxSize:    int64(logConf.MaxSize) << 20, // unit is MB
-			rotation:   logConf.Rotation,
+			dir:      logConf.Path,
+			name:     name,
+			keepDays: logConf.KeepDays,
+			maxFiles: logConf.MaxBackups,
+			maxSize:  int64(logConf.MaxSize) << 20, // unit is MB
+			rotation: logConf.Rotation,
 		})
 		if err != nil {
 			writeSyncer = zapcore.AddSync(os.Stdout)

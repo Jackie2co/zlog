@@ -45,12 +45,15 @@ const (
 )
 
 type writerConfig struct {
-	dir        string
-	name       string
-	keepDays   int
-	maxBackups int
-	maxSize    int64 // bytes; only honored when rotation == "size"
-	rotation   string
+	dir      string
+	name     string
+	keepDays int
+	// maxFiles is the maximum number of log files kept in the directory,
+	// counting the file currently being written; 0 means unlimited.
+	// It comes from go-zero's LogConf.MaxBackups.
+	maxFiles int
+	maxSize  int64 // bytes; only honored when rotation == "size"
+	rotation string
 }
 
 // fileWriter is a concurrency-safe, buffered, rotating file writer.
@@ -400,35 +403,43 @@ func (w *fileWriter) updateLink() {
 	_ = os.Symlink(target, link)
 }
 
-// isOwnFile reports whether name is a rotated file of this logger. The
-// name is matched exactly ("<name>-<timestamp>.log") instead of by a bare
-// prefix: with a plain prefix match a sibling logger whose name starts
-// with this one ("app" and "app-errors" writing into the same directory)
-// would have its live files deleted as if they were our backups.
-func (w *fileWriter) isOwnFile(name string) bool {
+// parseFileName returns the timestamp embedded in a rotated file name. Only
+// names that belong to this logger are accepted ("<name>-<timestamp>.log"),
+// which keeps the retention pass from touching a sibling logger whose name
+// merely starts with this one ("app" and "app-errors" sharing a directory).
+func (w *fileWriter) parseFileName(name string) (time.Time, bool) {
 	prefix := w.cfg.name + "-"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".log") {
-		return false
+		return time.Time{}, false
 	}
 	stem := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".log")
 	// both layouts are accepted so files survive a change of Rotation mode
 	for _, layout := range []string{timeHourLayout, timeSecondLayout} {
-		if _, err := time.ParseInLocation(layout, stem, time.Local); err == nil {
-			return true
+		if t, err := time.ParseInLocation(layout, stem, time.Local); err == nil {
+			return t, true
 		}
 	}
 	// size rotation appends "-1", "-2", ... to disambiguate a slot
 	if i := strings.LastIndexByte(stem, '-'); i > 0 {
 		if _, err := strconv.Atoi(stem[i+1:]); err == nil {
-			_, err := time.ParseInLocation(timeSecondLayout, stem[:i], time.Local)
-			return err == nil
+			if t, err := time.ParseInLocation(timeSecondLayout, stem[:i], time.Local); err == nil {
+				return t, true
+			}
 		}
 	}
-	return false
+	return time.Time{}, false
 }
 
-// cleanupLocked enforces KeepDays (by mtime) and, for size rotation,
-// MaxBackups (newest N rotated files, current file excluded).
+// cleanupLocked applies the retention rules to the directory:
+//
+//   - KeepDays removes files whose mtime is older than N days (go-zero
+//     semantics).
+//   - MaxBackups, exposed here as cfg.maxFiles, caps how many log files the
+//     directory holds. The file currently being written counts towards the
+//     limit and is never removed; the oldest rotated files go first.
+//
+// The two rules are independent and whichever is hit first wins, matching
+// go-zero. Both work for time based and size based rotation.
 func (w *fileWriter) cleanupLocked() {
 	entries, err := os.ReadDir(w.cfg.dir)
 	if err != nil {
@@ -439,26 +450,60 @@ func (w *fileWriter) cleanupLocked() {
 		current = filepath.Base(w.file.Name())
 	}
 	now := w.now()
-	var backups []string
+
+	type rotated struct {
+		name string
+		at   time.Time // timestamp embedded in the file name
+		mod  time.Time // mtime, used by the KeepDays rule like go-zero
+	}
+	var files []rotated
 	for _, e := range entries {
-		if e.IsDir() || !w.isOwnFile(e.Name()) {
+		if e.IsDir() || e.Name() == current {
 			continue
 		}
-		if e.Name() == current {
+		at, ok := w.parseFileName(e.Name())
+		if !ok {
 			continue
 		}
-		backups = append(backups, e.Name())
-		if w.cfg.keepDays > 0 {
-			if info, ierr := e.Info(); ierr == nil &&
-				now.Sub(info.ModTime()) > time.Duration(w.cfg.keepDays)*24*time.Hour {
-				_ = os.Remove(filepath.Join(w.cfg.dir, e.Name()))
-			}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		files = append(files, rotated{name: e.Name(), at: at, mod: info.ModTime()})
+	}
+	// newest first: the timestamp in the name is authoritative, so a file
+	// whose mtime was touched by an external tool still ages correctly
+	sort.Slice(files, func(i, j int) bool {
+		if files[i].at.Equal(files[j].at) {
+			return files[i].name > files[j].name
+		}
+		return files[i].at.After(files[j].at)
+	})
+
+	removed := 0
+	for i, f := range files {
+		expired := w.cfg.keepDays > 0 &&
+			now.Sub(f.mod) > time.Duration(w.cfg.keepDays)*24*time.Hour
+		// the open file is already excluded above, so only maxFiles-1
+		// rotated files may stay for the directory to hold maxFiles files
+		tooMany := w.cfg.maxFiles > 0 && i >= w.cfg.maxFiles-1
+		if !expired && !tooMany {
+			continue
+		}
+		if err := os.Remove(filepath.Join(w.cfg.dir, f.name)); err == nil {
+			removed++
+		} else {
+			w.reportErr(err)
 		}
 	}
-	if w.cfg.rotation == "size" && w.cfg.maxBackups > 0 && len(backups) > w.cfg.maxBackups {
-		sort.Sort(sort.Reverse(sort.StringSlice(backups))) // names sort by time, newest first
-		for _, b := range backups[w.cfg.maxBackups:] {
-			_ = os.Remove(filepath.Join(w.cfg.dir, b))
-		}
+	if removed > 0 {
+		w.reportRetention(removed, len(files)-removed+1)
 	}
+}
+
+// reportRetention records what a retention pass removed so an operator can
+// tell a too small MaxBackups from a too quiet service.
+func (w *fileWriter) reportRetention(removed, kept int) {
+	fmt.Fprintf(os.Stderr, "[zlog] %s: retained %d log files, removed %d\n",
+		w.cfg.name, kept, removed)
 }

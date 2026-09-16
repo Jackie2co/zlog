@@ -1,8 +1,10 @@
 package zlog
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -336,6 +338,133 @@ func TestFileWriterCleanupLeavesSiblingFilesAlone(t *testing.T) {
 	if _, err := os.Stat(sibling); err != nil {
 		t.Fatalf("sibling logger file must be left alone: %v", err)
 	}
+}
+
+// MaxBackups (cfg.maxFiles) caps how many log files the directory holds:
+// the newest N files survive, the file being written is always one of them.
+func TestFileWriterMaxFilesKeepsNewestHourlyFiles(t *testing.T) {
+	dir := t.TempDir()
+	clock := newTestClock(time.Date(2026, 9, 16, 0, 10, 0, 0, time.Local))
+	w, err := newFileWriter(writerConfig{dir: dir, name: "app", maxFiles: 4}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	for i := 0; i < 9; i++ {
+		if i > 0 {
+			clock.Advance(time.Hour)
+		}
+		line := fmt.Sprintf("hour-%02d\n", i)
+		if _, err := w.Write([]byte(line)); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := ownLogFiles(t, dir, "app")
+	want := []string{
+		"app-2026-09-16-05.log",
+		"app-2026-09-16-06.log",
+		"app-2026-09-16-07.log",
+		"app-2026-09-16-08.log",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("retained files = %v, want %v", got, want)
+	}
+	if got := readFile(t, filepath.Join(dir, "app-2026-09-16-08.log")); got != "hour-08\n" {
+		t.Fatalf("current file content = %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "app-2026-09-16-05.log")); got != "hour-05\n" {
+		t.Fatalf("oldest retained file content = %q", got)
+	}
+}
+
+// maxFiles = 1 keeps only the file being written; 0 keeps everything, which
+// is go-zero's default and the previous behaviour of this library.
+func TestFileWriterMaxFilesEdges(t *testing.T) {
+	for _, tc := range []struct {
+		maxFiles int
+		want     int
+	}{
+		{maxFiles: 1, want: 1},
+		{maxFiles: 2, want: 2},
+		{maxFiles: 0, want: 4},
+	} {
+		t.Run(fmt.Sprintf("maxFiles=%d", tc.maxFiles), func(t *testing.T) {
+			dir := t.TempDir()
+			clock := newTestClock(time.Date(2026, 9, 16, 0, 10, 0, 0, time.Local))
+			w, err := newFileWriter(writerConfig{dir: dir, name: "app", maxFiles: tc.maxFiles}, clock.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+
+			for i := 0; i < 4; i++ {
+				if i > 0 {
+					clock.Advance(time.Hour)
+				}
+				if _, err := w.Write([]byte("entry\n")); err != nil {
+					t.Fatal(err)
+				}
+				if err := w.Sync(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			files := ownLogFiles(t, dir, "app")
+			if len(files) != tc.want {
+				t.Fatalf("retained %d files (%v), want %d", len(files), files, tc.want)
+			}
+			current := "app-" + clock.Now().Format("2006-01-02-15") + ".log"
+			if _, err := os.Stat(filepath.Join(dir, current)); err != nil {
+				t.Fatalf("the file being written must never be removed: %v", err)
+			}
+		})
+	}
+}
+
+// Retention by file count must not touch a sibling logger's files either.
+func TestFileWriterMaxFilesLeavesSiblingFilesAlone(t *testing.T) {
+	dir := t.TempDir()
+	sibling := filepath.Join(dir, "app-errors-2026-09-16-00.log")
+	if err := os.WriteFile(sibling, []byte("keep me\n"), fileMode); err != nil {
+		t.Fatal(err)
+	}
+
+	clock := newTestClock(time.Date(2026, 9, 16, 1, 10, 0, 0, time.Local))
+	w, err := newFileWriter(writerConfig{dir: dir, name: "app", maxFiles: 1}, clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	if _, err := w.Write([]byte("own\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readFile(t, sibling); got != "keep me\n" {
+		t.Fatalf("sibling logger file was modified: %q", got)
+	}
+}
+
+func ownLogFiles(t *testing.T, dir, name string) []string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, name+"-*.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		names = append(names, filepath.Base(f))
+	}
+	sort.Strings(names)
+	return names
 }
 
 func readFile(t *testing.T, path string) string {

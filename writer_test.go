@@ -90,14 +90,14 @@ func TestFileWriterSizeRotationAndByteIntegrity(t *testing.T) {
 	}
 }
 
-func TestFileWriterMaxBackups(t *testing.T) {
+func TestFileWriterMaxFilesSizeRotation(t *testing.T) {
 	dir := t.TempDir()
 	w, err := newFileWriter(writerConfig{
-		dir:        dir,
-		name:       "app",
-		rotation:   "size",
-		maxSize:    128,
-		maxBackups: 2,
+		dir:      dir,
+		name:     "app",
+		rotation: "size",
+		maxSize:  128,
+		maxFiles: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -118,8 +118,8 @@ func TestFileWriterMaxBackups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) > 3 { // 2 backups + current
-		t.Fatalf("expected at most 3 files, got %d", len(files))
+	if len(files) > 2 { // maxFiles counts the file being written
+		t.Fatalf("expected at most 2 files, got %d", len(files))
 	}
 }
 
@@ -361,5 +361,43 @@ func TestParseLevel(t *testing.T) {
 		if got := parseLevel(in); got != want {
 			t.Errorf("parseLevel(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+// Log.Level is a minimum level: every entry at or above it is written, so
+// "info" keeps warn and error too.
+func TestLoggerLevelFiltering(t *testing.T) {
+	cases := []struct {
+		level string
+		want  map[string]bool
+	}{
+		{"debug", map[string]bool{"debug": true, "info": true, "warn": true, "error": true}},
+		{"info", map[string]bool{"debug": false, "info": true, "warn": true, "error": true}},
+		{"warn", map[string]bool{"debug": false, "info": false, "warn": true, "error": true}},
+		{"error", map[string]bool{"debug": false, "info": false, "warn": false, "error": true}},
+	}
+	for _, c := range cases {
+		t.Run(c.level, func(t *testing.T) {
+			dir := t.TempDir()
+			name := "lvl-" + c.level
+			l := NewWithConf(name, logx.LogConf{Mode: "file", Path: dir, Level: c.level})
+			l.Debug("level-debug")
+			l.Info("level-info")
+			l.Warn("level-warn")
+			l.Error("level-error")
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(dir, name, name+".log"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for level, want := range c.want {
+				if got := strings.Contains(string(data), "level-"+level); got != want {
+					t.Errorf("level %q: %s level entry written = %v, want %v\ngot: %s",
+						c.level, level, got, want, data)
+				}
+			}
+		})
 	}
 }
